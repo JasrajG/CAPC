@@ -1,212 +1,114 @@
-import glob
+# dataset.py
+import os
 import torch
-from torch.utils.data import Dataset
 import numpy as np
-
-
-def UT_HAR_dataset(root_dir, portion=None):
-	"""Reads UT_HAR dataset and returns WiFi data as tensors.
-
-	Args:
-		root_dir (string): Root directory containing UT_HAR data and label files.
-
-	Returns:
-		dict: Dictionary containing WiFi data as tensors.
-	"""
-
-	WiFi_data = {}
-	data_list = glob.glob(root_dir+'/UT_HAR/data/*.csv')
-	label_list = glob.glob(root_dir+'/UT_HAR/label/*.csv')
-
-	# Process data files
-	for data_dir in data_list:
-		data_name = data_dir.split('/')[-1].split('.')[0]
-		with open(data_dir, 'rb') as f:
-			data = np.load(f)
-			data = data.reshape(len(data),1,250,90)
-			data_norm = (data - np.min(data)) / (np.max(data) - np.min(data))
-		WiFi_data[data_name] = torch.Tensor(data_norm)
-	
-	# Process label files
-	for label_dir in label_list:
-		label_name = label_dir.split('/')[-1].split('.')[0]
-		with open(label_dir, 'rb') as f:
-			label = np.load(f)
-		WiFi_data[label_name] = torch.Tensor(label).to(torch.int64)
-	
-	if portion is not None:
-		train_x = np.load(f'{root_dir}/UT_HAR/data/unsupervised_{portion}_X.npy')
-		train_y = np.load(f'{root_dir}/UT_HAR/label/unsupervised_{portion}_y.npy')
-		WiFi_data['X_train'] = torch.Tensor(train_x)
-		WiFi_data['y_train'] = torch.Tensor(train_y).to(torch.int64)
-
-	remaining_train_x = np.load(f'{root_dir}/UT_HAR/data/remaining_train_X.npy')
-	remaining_train_y = np.load(f'{root_dir}/UT_HAR/label/remaining_train_y.npy')
-
-	WiFi_data['remaining_train_X'] = torch.Tensor(remaining_train_x)
-	WiFi_data['remaining_train_y'] = torch.Tensor(remaining_train_y).to(torch.int64)
-
-	# Shape 1 x 250 (Time) x 90 (antenna x subcarrier)
-	return WiFi_data
+from torch.utils.data import Dataset
 
 class SignFiDataset(Dataset):
-	def __init__(self, root_dir, type, env, link='all', mode='double', portion=12, return_remaining=False):
-		self.root_dir = root_dir
-		self.env = env
-		self.link = link
-		self.mode = mode
+    def __init__(self, root_dir, type, env, global_min, global_max, link='all', mode='single', portion=10):
+        self.root_dir = root_dir
+        self.type = type
+        self.env = env
+        self.global_min = global_min
+        self.global_max = global_max
+        self.link = link
+        self.mode = mode
+        self.portion = portion
+        self.csid, self.csiu, self.csi, self.label = None, None, None, None
 
-		self.csid = None
-		self.csiu = None
-		self.csi = None
-		self.label = None
+        self._load_data()
+        self._normalize_data()
+        self._combine_links()
 
-		if link != 'all' and mode == 'dual':
-			raise ValueError('dual mode only supports all link')
+    def _load_data(self):
+        def _load_and_process(path):
+            if not os.path.exists(path):
+                print(f"Warning: Data file not found at {path}")
+                return None
+            data = np.load(path)
+            data_abs = np.abs(data)
+            if "reduced(in_env)" in path:
+                return np.transpose(data_abs, (0, 3, 2, 1))
+            else:
+                return np.transpose(data_abs, (3, 2, 1, 0))
 
-		if env == 'lab_same' and type == 'train':
-			portion = 6 if portion is None else portion
-			env = 'lab'
-			if return_remaining:
-				if link == 'dl':
-					self.csid = np.load(self.root_dir + f'reduced(in_env)_{env}_csid_{type}_remaining.npy').transpose(3, 1, 2, 0)
-				if link == 'ul':
-					self.csiu = np.load(self.root_dir + f'reduced(in_env)_{env}_csiu_{type}_remaining.npy').transpose(3, 1, 2, 0)
-				if link == 'all':
-					self.csid = np.load(self.root_dir + f'reduced(in_env)_{env}_csid_{type}_remaining.npy').transpose(3, 1, 2, 0)
-					self.csiu = np.load(self.root_dir + f'reduced(in_env)_{env}_csiu_{type}_remaining.npy').transpose(3, 1, 2, 0)
-				self.label = np.load(self.root_dir + f'reduced(in_env)_{env}_y_{type}_remaining.npy')
-				if self.mode == 'single':
-					self.csi = np.concatenate((self.csid, self.csiu), axis=3)
-					self.label = np.concatenate((self.label, self.label), axis=0)
-			else:
-				if link == 'dl':
-					self.csid = np.load(self.root_dir + f'reduced(in_env)_{env}_csid_{type}_{portion}.npy').transpose(3, 1, 2, 0)
-				if link == 'ul':	
-					self.csiu = np.load(self.root_dir + f'reduced(in_env)_{env}_csiu_{type}_{portion}.npy').transpose(3, 1, 2, 0)
-				if link == 'all':
-					self.csid = np.load(self.root_dir + f'reduced(in_env)_{env}_csid_{type}_{portion}.npy').transpose(3, 1, 2, 0)
-					self.csiu = np.load(self.root_dir + f'reduced(in_env)_{env}_csiu_{type}_{portion}.npy').transpose(3, 1, 2, 0)
-				self.label = np.load(self.root_dir + f'reduced(in_env)_{env}_y_{type}_{portion}.npy')
-				if self.mode == 'single':
-					self.csi = np.concatenate((self.csid, self.csiu), axis=3)
-					self.label = np.concatenate((self.label, self.label), axis=0)
-		else:		
-			env = 'lab' if env == 'lab_same' else env		
-			if portion is not None and type == 'train' and link == 'all' and mode == 'single':
-				self.csi = np.load(self.root_dir + f'reduced_{env}_csi_{type}_{portion}.npy')
-				self.label = np.load(self.root_dir + f'reduced_{env}_y_{type}_{portion}.npy')
-			else:
-				if link == 'all':
-						self.csid = np.load(self.root_dir + f'{env}_csid_{type}.npy').transpose(2, 1, 0, 3)
-						self.csiu = np.load(self.root_dir + f'{env}_csiu_{type}.npy').transpose(2, 1, 0, 3)
-						self.label = np.load(self.root_dir + f'{env}_y_{type}.npy') - 1
-						if self.mode == 'single':
-							self.csi = np.concatenate((self.csid, self.csiu), axis=3)
-							self.label = np.concatenate((self.label, self.label), axis=0)
-				elif link == 'dl':
-					self.csid = np.load(self.root_dir + f'{env}_csid_{type}.npy').transpose(2, 1, 0, 3)
-					self.label = np.load(self.root_dir + f'{env}_y_{type}.npy') - 1
-				elif link == 'ul':
-					self.csiu = np.load(self.root_dir + f'{env}_csiu_{type}.npy').transpose(2, 1, 0, 3)
-					self.label = np.load(self.root_dir + f'{env}_y_{type}.npy') - 1
-				else:
-					raise ValueError('Invalid link type')
+        if self.type == 'train' and self.env == 'home':
+            csid_path = os.path.join(self.root_dir, f'reduced(in_env)_{self.env}_csid_{self.type}_{self.portion}.npy')
+            csiu_path = os.path.join(self.root_dir, f'reduced(in_env)_{self.env}_csiu_{self.type}_{self.portion}.npy')
+            label_path = os.path.join(self.root_dir, f'reduced(in_env)_{self.env}_y_{self.type}_{self.portion}.npy')
+        elif self.type == 'train' and self.env == 'lab':
+            csid_path = os.path.join(self.root_dir, 'dl.npy')
+            csiu_path = os.path.join(self.root_dir, 'ul.npy')
+            label_path = os.path.join(self.root_dir, 'label_lab.npy')
+        else:
+            csid_path = os.path.join(self.root_dir, f'{self.env}_csid_{self.type}.npy')
+            csiu_path = os.path.join(self.root_dir, f'{self.env}_csiu_{self.type}.npy')
+            label_path = os.path.join(self.root_dir, f'{self.env}_y_{self.type}.npy')
+        
+        if self.link in ['dl', 'all']: self.csid = _load_and_process(csid_path)
+        if self.link in ['ul', 'all']: self.csiu = _load_and_process(csiu_path)
+        
+        if os.path.exists(label_path):
+            self.label = np.load(label_path)
+            if self.label is not None: self.label = self.label - 1
+        else:
+            print(f"Warning: Label file not found at {label_path}")
 
-				# Get Amplitude
-				if self.csid is not None:
-					self.csid = np.abs(self.csid)
-				if self.csiu is not None:
-					self.csiu = np.abs(self.csiu)
-				if self.csi is not None:
-					self.csi = np.abs(self.csi)
+    def _normalize_data(self):
+        def _normalize(data):
+            if data is None: return None
+            denominator = self.global_max - self.global_min
+            if denominator == 0: return data - self.global_min
+            return (data - self.global_min) / denominator
+        self.csid = _normalize(self.csid)
+        self.csiu = _normalize(self.csiu)
 
-				# Normalize
-				if self.csid is not None:
-					self.csid = (self.csid - np.min(self.csid)) / (np.max(self.csid) - np.min(self.csid))
-				if self.csiu is not None:
-					self.csiu = (self.csiu - np.min(self.csiu)) / (np.max(self.csiu) - np.min(self.csiu))
-				if self.csi is not None:
-					self.csi = (self.csi - np.min(self.csi)) / (np.max(self.csi) - np.min(self.csi))
+    def _combine_links(self):
+        if self.mode == 'single':
+            csi_parts = [d for d in [self.csid, self.csiu] if d is not None]
+            if not csi_parts: raise FileNotFoundError(f"No CSI data found for single mode in env '{self.env}'")
+            self.csi = np.concatenate(csi_parts, axis=0)
+            if len(csi_parts) > 1 and self.label is not None:
+                self.label = np.concatenate((self.label, self.label), axis=0)
 
+    def __len__(self):
+        if self.mode == 'single': return len(self.csi) if self.csi is not None else 0
+        return len(self.csid) if self.csid is not None else 0
 
+    def __getitem__(self, idx):
+        label_to_return = 0
+        if self.label is not None:
+            label_to_return = self.label[idx].astype('int64')
+        if self.mode == 'dual':
+            return torch.FloatTensor(self.csid[idx]), torch.FloatTensor(self.csiu[idx]), label_to_return
+        else:
+            return torch.FloatTensor(self.csi[idx]), label_to_return
 
-	def __len__(self):
-		if self.mode == 'single':
-			return self.csi.shape[3]
-		elif self.mode == 'dual':
-			return self.csid.shape[3]
-		else:
-			raise ValueError('Invalid mode type')
-	
-	def __getitem__(self, idx):
-		if self.mode == 'single':
-			return torch.DoubleTensor(self.csi[:,:,:,idx]), self.label[idx].astype('int64')
-		elif self.mode == 'dual':
-			return torch.DoubleTensor(self.csid[:,:,:,idx]), torch.DoubleTensor(self.csiu[:,:,:,idx]), self.label[idx].astype('int64')
-		else:
-			raise ValueError('Invalid mode type')
-
-def create_loader_from_dataset(train_set, val_set, test_set, batch_size, num_workers, mode):
-	if mode == 'train_data':
-		unsupervised_train_dataset = train_set
-	else:
-		if val_set:
-			unsupervised_train_dataset = torch.utils.data.ConcatDataset([train_set, val_set, test_set])
-		else:
-			unsupervised_train_dataset = torch.utils.data.ConcatDataset([train_set, test_set])
-	train_loader = torch.utils.data.DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=num_workers)
-	test_loader = torch.utils.data.DataLoader(test_set, batch_size=256, shuffle=False, num_workers=num_workers)
-	if val_set:
-		val_loader = torch.utils.data.DataLoader(val_set, batch_size=batch_size, shuffle=False, num_workers=num_workers)
-	unsupervised_train_loader = torch.utils.data.DataLoader(unsupervised_train_dataset, batch_size=batch_size, shuffle=True, drop_last=True, num_workers=num_workers)
-	if val_set:
-		return train_loader, val_loader, test_loader, unsupervised_train_loader
-	else:
-		return train_loader, None, test_loader, unsupervised_train_loader
-
-
-def load_UT_HAR_dataset(root, batch_size, num_workers, mode, portion=None):
-	data = UT_HAR_dataset(root, portion)
-	unsupervised_train_set = torch.utils.data.TensorDataset(data['remaining_train_X'], data['remaining_train_y'])
-	train_set = torch.utils.data.TensorDataset(data['X_train'], data['y_train'])
-	val_set = torch.utils.data.TensorDataset(data['X_val'], data['y_val'])
-	test_set = torch.utils.data.TensorDataset(data['X_test'], data['y_test'])
-
-	train_loader, val_loader, test_loader, _ = create_loader_from_dataset(train_set, val_set, test_set, batch_size, num_workers, mode)
-	unsupervised_train_loader = torch.utils.data.DataLoader(unsupervised_train_set, batch_size=batch_size, shuffle=True, drop_last=True, num_workers=num_workers)
-
-	return train_loader, val_loader, test_loader, unsupervised_train_loader
-
-def load_SignFi_data(root, name, batch_size, num_workers, mode, signfi_env, signfi_link, signfi_mode, portion=12):
-	if signfi_env == 'lab_same':
-		train_dataset = SignFiDataset(root, 'train', signfi_env, signfi_link, signfi_mode, portion=portion, return_remaining=False)
-		unsupervised_train_dataset = SignFiDataset(root, 'train', signfi_env, signfi_link, signfi_mode, return_remaining=True)
-		val_dataset = SignFiDataset(root, 'val', signfi_env, signfi_link, signfi_mode, portion=portion)
-		test_dataset = SignFiDataset(root, 'test', signfi_env, signfi_link, signfi_mode, portion=portion)
-
-		unsupervised_train_loader = torch.utils.data.DataLoader(unsupervised_train_dataset, batch_size=batch_size, shuffle=True, drop_last=True, num_workers=num_workers)
-		
-		train_loader, val_loader, test_loader, _ = create_loader_from_dataset(train_dataset, val_dataset, test_dataset, batch_size, num_workers, mode)
-
-		return train_loader, val_loader, test_loader, unsupervised_train_loader
-	else:
-		train_dataset = SignFiDataset(root, 'train', signfi_env, signfi_link, signfi_mode, portion=portion)
-		val_dataset = SignFiDataset(root, 'val', signfi_env, signfi_link, signfi_mode, portion=portion)
-		test_dataset = SignFiDataset(root, 'test', signfi_env, signfi_link, signfi_mode, portion=portion)
-
-		return create_loader_from_dataset(train_dataset, val_dataset, test_dataset, batch_size, num_workers, mode)
-
-def data_loader(cfg, num_workers=20, validation_split=0.2):
-	root = cfg['root_dir']
-	batch_size = cfg['batch_size']
-	mode = cfg['mode'] if 'mode' in cfg else None
-
-	if cfg['name'] == 'UT_HAR':
-		return load_UT_HAR_dataset(root, batch_size, num_workers, mode, portion=cfg['portion'])
-	
-	if cfg['type'] == 'SignFi':
-		portion = cfg['portion'] if 'portion' in cfg else None
-		return load_SignFi_data(root, cfg['name'], batch_size, num_workers, mode, cfg['SignFi_env'], cfg['SignFi_link'], cfg['SignFi_mode'], portion)
-
-	raise ValueError('Invalid dataset type')
+def data_loader(cfg, num_workers=0):
+    env = 'lab' if cfg.get('SignFi_env') == 'lab' else cfg.get('SignFi_env')
+    global_min, global_max = cfg['global_min'], cfg['global_max']
+    if env == 'lab':
+        dataset = SignFiDataset(
+            cfg['root_dir'], 'train', 'lab', global_min, global_max,
+            link=cfg.get('SignFi_link', 'all'), mode=cfg.get('SignFi_mode', 'dual')
+        )
+        loader = torch.utils.data.DataLoader(dataset, batch_size=cfg['batch_size'], shuffle=True, drop_last=True, num_workers=num_workers)
+        return None, None, None, loader
+    elif env == 'home':
+        train_dataset = SignFiDataset(
+            cfg['root_dir'], 'train', 'home', global_min, global_max,
+            link=cfg.get('SignFi_link', 'all'), mode='single', portion=cfg.get('portion')
+        )
+        val_dataset = SignFiDataset(
+            cfg['root_dir'], 'val', 'home', global_min, global_max,
+            link=cfg.get('SignFi_link', 'all'), mode='single'
+        )
+        test_dataset = SignFiDataset(
+            cfg['root_dir'], 'test', 'home', global_min, global_max,
+            link=cfg.get('SignFi_link', 'all'), mode='single'
+        )
+        train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=cfg['batch_size'], shuffle=True, num_workers=num_workers)
+        val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=cfg['batch_size'], shuffle=False, num_workers=num_workers)
+        test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=512, shuffle=False, num_workers=num_workers)
+        return train_loader, val_loader, test_loader, None
+    raise ValueError(f"Invalid SignFi_env: {cfg.get('SignFi_env')}")
