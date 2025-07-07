@@ -1,4 +1,5 @@
-# models.py
+# /Users/MAC/Projects/CAPC-replica/models.py
+
 import math
 import random
 import torch
@@ -8,8 +9,9 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 import torchmetrics
 import numpy as np
-from modules import projector, RecurrentEncoder
+from modules import projector, SpectrogramEncoder
 
+# ... (off_diagonal, nt_xent_loss, cosine_similarity_loss, and SSLModel class are all unchanged) ...
 def off_diagonal(x):
     n, m = x.shape
     assert n == m
@@ -35,19 +37,22 @@ def cosine_similarity_loss(p, z):
     z = F.normalize(z, dim=1)
     return -(p * z).sum(dim=1).mean()
 
+
 class SSLModel(pl.LightningModule):
     def __init__(self, hparams):
         super(SSLModel, self).__init__()
         self.save_hyperparameters(hparams)
-        if 'n_hidden_states_nodes_last_layer' not in self.hparams['model']:
-            self.hparams['model']['n_hidden_states_nodes_last_layer'] = self.hparams['model']['n_hidden_states_nodes']
-        self.encoder = RecurrentEncoder(
-            input_type=self.hparams['dataset']['type'], num_frames=self.hparams['model']['num_frames'],
-            embedding_size=self.hparams['model']['embedding_size'], recurrent_block=self.hparams['model']['recurrent_block']
+        self.encoder = SpectrogramEncoder(
+            spec_shape=self.hparams['model']['spec_shape'],
+            num_frames_per_window=self.hparams['model']['window_width'],
+            embedding_size=self.hparams['model']['embedding_size'],
+            recurrent_block=self.hparams['model']['recurrent_block']
         )
-        self.encoder_2 = self.encoder if self.hparams['model']['shared_weights'] else RecurrentEncoder(
-            input_type=self.hparams['dataset']['type'], num_frames=self.hparams['model']['num_frames'],
-            embedding_size=self.hparams['model']['embedding_size'], recurrent_block=self.hparams['model']['recurrent_block']
+        self.encoder_2 = self.encoder if self.hparams['model']['shared_weights'] else SpectrogramEncoder(
+            spec_shape=self.hparams['model']['spec_shape'],
+            num_frames_per_window=self.hparams['model']['window_width'],
+            embedding_size=self.hparams['model']['embedding_size'],
+            recurrent_block=self.hparams['model']['recurrent_block']
         )
         model_name = self.hparams['model'].get('name', 'CAPC')
         projector_input_dim = self.hparams['model']['n_hidden_states_nodes_last_layer'] if model_name == 'CAPC' else self.hparams['model']['embedding_size']
@@ -90,49 +95,42 @@ class SSLModel(pl.LightningModule):
         return encode_samples, pred, c_t
 
     def _get_views(self, batch):
-        if len(batch) == 2: return batch[0], batch[0], batch[1]
-        x1, x2, y = batch
-        if self.hparams['model']['augmentations'].get('dual_view', False) and random.random() > 0.5:
-            return x2, x1, y
-        return x1, x2, y
+        x, y = batch
+        return x, x.clone(), y
 
     def training_step(self, batch, batch_idx):
         x1_raw, x2_raw, y = self._get_views(batch)
-        x1, x2 = x1_raw.clone(), x2_raw.clone()
-
         if self.hparams['model']['augmentations'].get('gaussian_noise'):
-            noise = torch.randn_like(x1) * 0.1
-            x1.add_(noise); x2.add_(noise)
+            noise = torch.randn_like(x1_raw) * 0.1
+            x1_raw.add_(noise); x2_raw.add_(noise)
         if self.hparams['model']['augmentations'].get('time_flip'):
-            if random.random() > 0.5: x1 = torch.flip(x1, dims=[3])
-            if random.random() > 0.5: x2 = torch.flip(x2, dims=[3])
+            if random.random() > 0.5: x1_raw = torch.flip(x1_raw, dims=[-1])
+            if random.random() > 0.5: x2_raw = torch.flip(x2_raw, dims=[-1])
         if self.hparams['model']['augmentations'].get('time_mask'):
-            mask_len = int(x1.shape[3] * 0.2)
-            x1[:, :, :, random.randint(0, x1.shape[3] - mask_len):].mul_(0)
-            x2[:, :, :, random.randint(0, x2.shape[3] - mask_len):].mul_(0)
-
-        f1, _ = self.encoder(x1, view_mode='in_sequence')
-        f2, _ = self.encoder_2(x2, view_mode='in_sequence')
-
+            mask_len = int(x1_raw.shape[-1] * 0.2)
+            start_pos = random.randint(0, x1_raw.shape[-1] - mask_len)
+            x1_raw[:, :, :, start_pos:start_pos+mask_len].mul_(0)
+            x2_raw[:, :, :, start_pos:start_pos+mask_len].mul_(0)
+        f1, _ = self.encoder(x1_raw)
+        f2, _ = self.encoder_2(x2_raw)
         model_name = self.hparams['model']['name']
         if model_name == 'CAPC':
             t_samples = torch.randint(self.encoder.sequence_length - self.timestep, size=(1,)).long()
-            e1, p1, c1 = self.CPC(f1, x1.size(0), t_samples)
-            e2, p2, c2 = self.CPC(f2, x2.size(0), t_samples)
+            e1, p1, c1 = self.CPC(f1, x1_raw.size(0), t_samples)
+            e2, p2, c2 = self.CPC(f2, x2_raw.size(0), t_samples)
             nce1 = sum(torch.sum(torch.diag(self.lsoftmax(torch.mm(e1[i], p1[i].T)))) for i in range(self.timestep))
             nce2 = sum(torch.sum(torch.diag(self.lsoftmax(torch.mm(e2[i], p2[i].T)))) for i in range(self.timestep))
-            loss_cpc = (nce1 + nce2) / (-1.0 * x1.size(0) * self.timestep)
+            loss_cpc = (nce1 + nce2) / (-1.0 * x1_raw.size(0) * self.timestep)
             z1, z2 = self.projector(c1), self.projector_2(c2)
-            loss_bt = self.barlow_twin_loss(z1, z2, x1.size(0))
+            loss_bt = self.barlow_twin_loss(z1, z2, x1_raw.size(0))
             loss = self.hparams['model']['cpc_coeff'] * loss_cpc + loss_bt
         else:
             z1 = self.projector(f1.mean(dim=1))
             z2 = self.projector_2(f2.mean(dim=1))
-            if model_name == 'BarlowTwins': loss = self.barlow_twin_loss(z1, z2, x1.size(0))
+            if model_name == 'BarlowTwins': loss = self.barlow_twin_loss(z1, z2, x1_raw.size(0))
             elif model_name == 'SimCLR': loss = nt_xent_loss(z1, z2)
             elif model_name == 'AutoFi': loss = cosine_similarity_loss(z1, z2)
             else: raise ValueError(f"Unknown model name: {model_name}")
-
         self.log("train_loss", loss, prog_bar=True, on_step=True, on_epoch=True)
         return loss
 
@@ -152,7 +150,7 @@ class LinearClassifierModel(pl.LightningModule):
             self.encoder.eval()
             for param in self.encoder.parameters():
                 param.requires_grad = False
-        flat_feature_size = self.encoder.embedding_size * self.encoder.sequence_length
+        flat_feature_size = self.encoder.sequence_length * self.encoder.embedding_size
         self.linear_separation = nn.Linear(flat_feature_size, self.hparams['dataset']['num_classes'])
         self.automatic_optimization = False
         self.train_accuracy = torchmetrics.classification.Accuracy(task="multiclass", num_classes=self.hparams['dataset']['num_classes'])
@@ -161,8 +159,14 @@ class LinearClassifierModel(pl.LightningModule):
 
     def forward(self, x):
         with torch.no_grad():
-            x, _ = self.encoder(x, view_mode='flat')
-        return self.linear_separation(x)
+            sequence_embedding, _ = self.encoder(x)
+        
+        batch_size = sequence_embedding.shape[0]
+        # --- THIS IS THE CORRECTED LINE ---
+        # .reshape() is safer than .view() and handles non-contiguous tensors automatically.
+        flat_features = sequence_embedding.reshape(batch_size, -1)
+        
+        return self.linear_separation(flat_features)
 
     def _common_step(self, batch, batch_idx):
         x, y = batch
@@ -206,16 +210,14 @@ class LinearClassifierModel(pl.LightningModule):
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.linear_separation.parameters(), lr=self.hparams['model']['lr'], weight_decay=self.hparams['model'].get('weight_decay', 0))
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.hparams['model']['epochs'])
-        return optimizer, scheduler
+        return [optimizer], [scheduler]
 
 class LARS(optim.Optimizer):
     def __init__(self, params, lr, weight_decay=0, momentum=0.9, eta=0.001, weight_decay_filter=False, lars_adaptation_filter=False):
         defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum, eta=eta, weight_decay_filter=weight_decay_filter, lars_adaptation_filter=lars_adaptation_filter)
         super().__init__(params, defaults)
-
     def exclude_bias_and_norm(self, p):
         return p.ndim == 1
-
     @torch.no_grad()
     def step(self, closure=None):
         if closure is not None:

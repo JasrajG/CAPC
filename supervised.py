@@ -1,70 +1,120 @@
-# supervised.py
+# /Users/MAC/Projects/CAPC-replica/supervised.py
+
 import argparse
 import os
-import pytorch_lightning as pl
-from pytorch_lightning.callbacks import ModelCheckpoint
 import torch
-from models import LinearClassifierModel
-from dataset import data_loader
-from modules import RecurrentEncoder
+import numpy as np
+import pytorch_lightning as pl
+import torchmetrics
+from pytorch_lightning.callbacks import ModelCheckpoint
+from torch.utils.data import DataLoader, Subset
+from dataset import EmbeddingDataset
+
+class LinearModel(pl.LightningModule):
+    def __init__(self, input_size, num_classes, lr):
+        super().__init__()
+        self.save_hyperparameters()
+        self.linear = torch.nn.Linear(input_size, num_classes)
+        self.accuracy = torchmetrics.Accuracy(task="multiclass", num_classes=num_classes)
+        self.test_accuracy = torchmetrics.Accuracy(task="multiclass", num_classes=num_classes)
+
+    def forward(self, x):
+        return self.linear(x)
+
+    def training_step(self, batch, batch_idx):
+        x, y = batch
+        y_hat = self(x)
+        loss = torch.nn.functional.cross_entropy(y_hat, y)
+        self.log('train_loss', loss)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        x, y = batch
+        y_hat = self(x)
+        loss = torch.nn.functional.cross_entropy(y_hat, y)
+        self.accuracy(y_hat, y)
+        self.log('val_loss', loss, prog_bar=True)
+        self.log('val_acc', self.accuracy, prog_bar=True, on_step=False, on_epoch=True)
+    
+    def test_step(self, batch, batch_idx):
+        x, y = batch
+        y_hat = self(x)
+        self.test_accuracy(y_hat, y)
+        self.log('test_acc', self.test_accuracy, on_step=False, on_epoch=True)
+
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
 
 def main():
-    parser = argparse.ArgumentParser(description="Supervised Linear Evaluation for CAPC")
-    parser.add_argument('--database_path', type=str, required=True, help="Path to the root data folder.")
-    parser.add_argument('--ssl_model_path', type=str, required=True, help="Path to the pre-trained SSL model .ckpt file.")
-    parser.add_argument('--portion', type=int, default=10, help="The 'k' in k-shot fine-tuning.")
-    parser.add_argument('--batch_size', type=int, default=512)
+    parser = argparse.ArgumentParser(description="FAST Supervised Linear Evaluation with a dedicated Validation Set")
+    parser.add_argument('--embedding_dir', type=str, default='/Users/MAC/Downloads/5 GHz Bandwidth_Embeddings', help="Path to the folder with embeddings.npy and labels.npy.")
+    parser.add_argument('--shots', type=int, default=10, help="Number of samples per class for training (k-shot).")
+    parser.add_argument('--val_samples', type=int, default=200, help="Number of samples per class for the validation set.")
     parser.add_argument('--epochs', type=int, default=100)
+    parser.add_argument('--batch_size', type=int, default=512)
     parser.add_argument('--lr', type=float, default=1e-2)
-    parser.add_argument('--num_workers', type=int, default=0)
-    parser.add_argument('--recurrent_block', action='store_true')
-
     args = parser.parse_args()
     pl.seed_everything(42)
 
-    print(f"--- Loading weights and stats from SSL checkpoint: {args.ssl_model_path} ---")
-    checkpoint = torch.load(args.ssl_model_path, map_location=torch.device('cpu'))
-    hparams = checkpoint['hyper_parameters']
-    
-    global_min = hparams['model']['global_min']
-    global_max = hparams['model']['global_max']
-    embedding_size = hparams['model']['embedding_size']
-    num_frames = hparams['model']['num_frames']
-    
-    print(f"--- Extracted stats from checkpoint: min={global_min:.2f}, max={global_max:.2f} ---")
+    # --- Step 1: Load the pre-computed embeddings ---
+    embeddings_path = os.path.join(args.embedding_dir, "embeddings.npy")
+    labels_path = os.path.join(args.embedding_dir, "labels.npy")
+    full_dataset = EmbeddingDataset(embeddings_path, labels_path)
 
-    cfg = {
-        'model': { 'epochs': args.epochs, 'lr': args.lr, 'weight_decay': 0 },
-        'dataset': {
-            'root_dir': args.database_path, 'batch_size': args.batch_size, 'type': 'SignFi',
-            'SignFi_env': 'home', 'SignFi_link': 'all', 'SignFi_mode': 'single',
-            'num_classes': 276, 'portion': args.portion,
-            'global_min': global_min, 'global_max': global_max
-        },
-        'freeze_encoder': True, 'semi_supervised': False
-    }
+    # --- Step 2: Create a Three-Way Data Split (Train, Validation, Test) ---
+    print("\n--- Creating Train/Validation/Test Split ---")
+    num_classes = len(np.unique(full_dataset.labels))
+    
+    train_indices = []
+    val_indices = []
+    
+    for i in range(num_classes):
+        # Find all indices for the current class
+        class_indices = list(np.where(full_dataset.labels == i)[0])
+        np.random.shuffle(class_indices) # Shuffle them to get random samples
+        
+        # Take the first 'k' for training
+        train_indices.extend(class_indices[:args.shots])
+        
+        # Take the next 'N' for validation
+        val_indices.extend(class_indices[args.shots : args.shots + args.val_samples])
 
-    train_loader, val_loader, test_loader, _ = data_loader(cfg['dataset'], args.num_workers)
+    # The test set is everything else
+    used_indices = set(train_indices + val_indices)
+    all_indices = set(range(len(full_dataset)))
+    test_indices = list(all_indices - used_indices)
+
+    # Create the PyTorch Subset objects
+    train_dataset = Subset(full_dataset, train_indices)
+    val_dataset = Subset(full_dataset, val_indices)
+    test_dataset = Subset(full_dataset, test_indices)
+
+    print(f"Training set size: {len(train_dataset)} samples ({args.shots} shots per class)")
+    print(f"Validation set size: {len(val_dataset)} samples")
+    print(f"Test set size: {len(test_dataset)} samples")
+
+    # Create DataLoaders
+    train_loader = DataLoader(train_dataset, batch_size=min(len(train_dataset), args.batch_size), shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size)
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size)
+
+    # --- Step 3: Train the Linear Model ---
+    input_size = full_dataset.embeddings.shape[1]
+    model = LinearModel(input_size, num_classes, args.lr)
     
-    # Rebuild the encoder with the correct architecture from the checkpoint
-    use_recurrent_block = hparams['model'].get('recurrent_block', False)
-    encoder = RecurrentEncoder(
-        input_type='SignFi', num_frames=num_frames, 
-        embedding_size=embedding_size, recurrent_block=use_recurrent_block
-    )
-    encoder_state_dict = {k.replace('encoder.', '', 1): v for k, v in checkpoint['state_dict'].items() if k.startswith('encoder.')}
-    encoder.load_state_dict(encoder_state_dict, strict=not use_recurrent_block) # Non-strict for CAPC->baseline eval mismatch
-    
-    model = LinearClassifierModel(pretrained_encoder=encoder, hparams=cfg)
-    
-    checkpoint_callback = ModelCheckpoint(monitor='val_acc_epoch', mode='max', filename='best-finetune-acc', save_top_k=1, verbose=True)
+    # This now correctly monitors the validation accuracy to save the best model
+    checkpoint_callback = ModelCheckpoint(monitor='val_acc', mode='max', filename='best-linear-head')
     trainer = pl.Trainer(max_epochs=args.epochs, accelerator='auto', callbacks=[checkpoint_callback])
-    
-    print("\n--- Starting fine-tuning of the linear head on 'home' data ---")
+
+    print("\n--- Starting LIGHTNING-FAST training of the linear head ---")
+    # This now uses the proper validation set
     trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
     
-    print("\n--- Starting testing with the best fine-tuned model on 'home' test set ---")
-    trainer.test(dataloaders=test_loader, ckpt_path='best')
+    print("\n--- Testing with best model chosen by validation set ---")
+    # This runs the final test on the unseen test data
+    test_results = trainer.test(dataloaders=test_loader, ckpt_path='best')
+
+  
 
 if __name__ == '__main__':
     main()
