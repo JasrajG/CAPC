@@ -2,106 +2,101 @@
 
 import argparse
 import os
+import torch
+import numpy as np
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint
-import numpy as np
+from torch.utils.data import DataLoader, random_split, Subset
 from models import SSLModel
-from dataset import TeraNovaDataset, DataLoader
-import torch.multiprocessing
+from dataset import TeraNovaDataset
 
 def main():
-    parser = argparse.ArgumentParser(description="Faithful CAPC SSL Framework for TeraNova WiFi Sensing")
-    
-    parser.add_argument('--database_path', type=str, default='/Users/MAC/Downloads/5 GHz Bandwidth_Preprocessed', help="Path to the PREPROCESSED TeraNova data folder.")
-    parser.add_argument('--epochs', type=int, default=300, help="The total number of epochs to train for.")
-    parser.add_argument('--batch_size', type=int, default=32) 
-    parser.add_argument('--recurrent_block', action='store_true', default=True)
-    
-    # --- THIS IS THE KEY ARGUMENT FOR RESUMING ---
-    # It tells the script which checkpoint file to load. Default is None (train from scratch).
-    parser.add_argument('--resume_from_checkpoint', type=str, default=None, help="Path to a checkpoint file to resume training from.")
-    
-    parser.add_argument('--model_name', type=str, default='CAPC', choices=['CAPC'])
-    
+    import json # We need this to load the parameters
+
+    parser = argparse.ArgumentParser(description="Unified Self-Supervised Pre-training Framework")
+    parser.add_argument('--params_file', type=str, default=None, help="[Optional] Path to a JSON file with model hyperparameters.")
+    parser.add_argument('--model_name', type=str, default='CAPC', choices=['CAPC', 'SimCLR', 'BarlowTwins', 'AutoFi'])
+    parser.add_argument('--split_dir', type=str, default='data_splits')
+    parser.add_argument('--epochs', type=int, default=100)
+    parser.add_argument('--batch_size', type=int, default=32)
+    parser.add_argument('--resume_from_checkpoint', type=str, default=None)
     args = parser.parse_args()
     pl.seed_everything(42)
 
-    # --- Configuration for the model input ---
-    SPECTROGRAM_HEIGHT = 129
-    SPECTROGRAM_WIDTH = 184
-    WINDOW_WIDTH = 23
-    
-    # --- Initialize the FAST dataset and dataloader ---
-    unsupervised_dataset = TeraNovaDataset(root_dir=args.database_path)
-    unsupervised_loader = DataLoader(
-        unsupervised_dataset, 
-        batch_size=args.batch_size, 
-        shuffle=True, 
-        drop_last=True,
-        num_workers=4 # Set to 0 for stability on macOS
-    )
-    
-    # --- Define the smaller model configuration to fit in 8GB RAM ---
-    base_model_cfg = {
-        'embedding_size': 64,
-        'n_hidden_states_nodes': 256,
-        'n_hidden_states_nodes_last_layer': 256,
-        'spec_shape': (1, SPECTROGRAM_HEIGHT, SPECTROGRAM_WIDTH),
-        'window_width': WINDOW_WIDTH,
-        'recurrent_block': args.recurrent_block,
-        'weight_decay': 1.5e-6, 
-        'shared_weights': True,
+    # --- Step 1: Define base defaults ---
+    SPECTROGRAM_HEIGHT, SPECTROGRAM_WIDTH, WINDOW_WIDTH = 129, 184, 23
+    model_cfg = {
+        'embedding_size': 64, 'n_hidden_states_nodes': 256, 'n_hidden_states_nodes_last_layer': 256,
+        'spec_shape': (1, SPECTROGRAM_HEIGHT, SPECTROGRAM_WIDTH), 'window_width': WINDOW_WIDTH,
+        'weight_decay': 1.5e-6,
     }
 
-    if args.model_name == 'CAPC':
-        model_cfg = base_model_cfg.copy()
-        model_cfg.update({
-            'name': 'CAPC', 'lambd': 0.002, 'cpc_coeff': 50.0, 'timestep': 4,
-            'augmentations': {'gaussian_noise': True, 'time_flip': True, 'time_mask': True},
-            'losses': ['CPC', 'barlow_twin'],
-        })
+    # --- Step 2: Load parameters from file, if provided ---
+    if args.params_file:
+        print(f"\n--- Loading hyperparameters from file: {args.params_file} ---")
+        with open(args.params_file, 'r') as f:
+            tuned_params = json.load(f)
+        # Update the defaults with the tuned values
+        model_cfg.update(tuned_params)
+        model_name = model_cfg.get('model_name', args.model_name)
     else:
-        raise NotImplementedError(f"Model '{args.model_name}' is not yet configured for this script.")
-    
+        model_name = args.model_name
+
+    # --- Step 3: Apply final model-specific architecture and augmentations ---
+    print(f"\n--- Final configuration for model: {model_name} ---")
+    model_cfg['name'] = model_name
+
+    if model_name == 'CAPC':
+        model_cfg['recurrent_block'] = True
+        model_cfg['shared_weights'] = False
+        # Set default CAPC loss params if not in the tuned file
+        model_cfg.setdefault('lambd', 0.002)
+        model_cfg.setdefault('cpc_coeff', 50.0)
+        model_cfg.setdefault('timestep', 4)
+        # CAPC uses all augmentations
+        model_cfg['augmentations'] = {'gaussian_noise': True, 'time_flip': True, 'time_mask': True}
+    else:
+        model_cfg['recurrent_block'] = False
+        model_cfg['shared_weights'] = True
+        
+        # Set augmentations based on the paper's ablation study
+        if model_name == 'BarlowTwins':
+            model_cfg['augmentations'] = {'gaussian_noise': True, 'time_mask': True}
+        elif model_name == 'SimCLR':
+            model_cfg['augmentations'] = {'time_mask': True}
+        elif model_name == 'AutoFi':
+            model_cfg['augmentations'] = {'gaussian_noise': True, 'time_flip': True}
+
     hparams = {'dataset': {'name': 'TeraNova'}, 'model': model_cfg}
+    
+    # --- This printout is your guarantee that the correct parameters are being used ---
+    print("\n--- Final Model Hyperparameters Being Used ---")
+    for key, value in model_cfg.items():
+        print(f"  {key}: {value}")
+    
+    # --- Data loading and trainer setup (unchanged) ---
+    pretrain_file_list = os.path.join(args.split_dir, 'pretrain_files.txt')
+    dataset_for_train = TeraNovaDataset(root_dir=None, file_list_path=pretrain_file_list, augmentations=model_cfg['augmentations'])
+    dataset_for_val = TeraNovaDataset(root_dir=None, file_list_path=pretrain_file_list, augmentations=None)
 
-    # --- Initialize and Train the Model ---
+    val_split_ratio = 0.1
+    train_size = int(len(dataset_for_train) * (1 - val_split_ratio))
+    val_size = len(dataset_for_train) - train_size
+    train_indices, val_indices = random_split(range(len(dataset_for_train)), [train_size, val_size])
+
+    train_ssl_dataset = Subset(dataset_for_train, train_indices)
+    val_ssl_dataset = Subset(dataset_for_val, val_indices)
+    
+    train_loader = DataLoader(train_ssl_dataset, batch_size=args.batch_size, shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_ssl_dataset, batch_size=args.batch_size, num_workers=0)
+
     model = SSLModel(hparams)
-    checkpoint_callback = ModelCheckpoint(
-        monitor="train_loss", mode="min", save_top_k=1, 
-        filename=f'{args.model_name}-TeraNova-small-{{epoch}}', verbose=True
-    )
-    trainer = pl.Trainer(
-        max_epochs=args.epochs, accelerator='auto', callbacks=[checkpoint_callback]
-    )
+    checkpoint_callback = ModelCheckpoint(monitor="val_loss", mode="min", save_top_k=1, filename=f'{model_name}-{{epoch}}', verbose=True)
+    trainer = pl.Trainer(max_epochs=args.epochs, accelerator='auto', callbacks=[checkpoint_callback])
     
-    print("\n" + "="*50)
-    print(f"  STARTING SELF-SUPERVISED PRE-TRAINING WITH {args.model_name} (SMALL MODEL)")
-    if args.resume_from_checkpoint:
-        print(f"  Resuming from checkpoint: {args.resume_from_checkpoint}")
-    print("="*50 + "\n")
-    
-    # --- The .fit() method uses the ckpt_path argument to resume ---
-    trainer.fit(
-        model, 
-        train_dataloaders=unsupervised_loader, 
-        ckpt_path=args.resume_from_checkpoint
-    )
-
-    print("\n" + "="*50)
-    print("  TRAINING COMPLETE  ")
-    print(f"  Best model saved at: {checkpoint_callback.best_model_path}")
-    print("="*50 + "\n")
+    print(f"\n--- STARTING PRE-TRAINING FOR {model_name} ---")
+    trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader, ckpt_path=args.resume_from_checkpoint)
+    print(f"\n--- PRE-TRAINING COMPLETE. Best model saved at: {checkpoint_callback.best_model_path} ---")
 
 if __name__ == '__main__':
-        # --- ADD THIS BLOCK TO FIX THE 'num_workers' HANG ---
-    # This must be the first thing in the main guard.
-    # It forces PyTorch to use a more stable method for creating background processes.
-    try:
-        import torch.multiprocessing as mp
-        mp.set_start_method('spawn', force=True)
-        print("Multiprocessing start method set to 'spawn'.")
-    except RuntimeError:
-        pass
-    # --- END OF ADDED BLOCK ---
     main()

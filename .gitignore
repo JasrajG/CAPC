@@ -1,9 +1,7 @@
-dl_data.npy
-ul_data.npy
-
-__pycache__
-
-hide
-
-lightning_logs
-
+# Ignore generated files and directories
+tuning_ckpts/
+data_splits/
+*.json
+*.ckpt
+.DS_Store
+__pycache__/
