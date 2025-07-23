@@ -1,7 +1,6 @@
-# Ignore generated files and directories
-tuning_ckpts/
-data_splits/
+lightning_logs/
+final_run_splits/
 *.json
-*.ckpt
 .DS_Store
 __pycache__/
+checkpoints/
